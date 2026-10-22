@@ -26,6 +26,7 @@ try:
     from rlpd.data.binary_datasets import BinaryDataset
 except:
     print("not importing binary dataset")
+from rlpd.dgn import DGN, actor_mean, noise_scale  # DGN
 from rlpd.evaluation import evaluate
 from rlpd.wrappers import wrap_gym
 
@@ -53,6 +54,22 @@ flags.DEFINE_boolean(
 flags.DEFINE_integer("utd_ratio", 1, "Update to data ratio.")
 flags.DEFINE_boolean(
     "binary_include_bc", True, "Whether to include BC data in the binary datasets."
+)
+
+# DGN: Data-Guided Noise flags. Defaults follow the paper's Adroit settings (Table 2).
+flags.DEFINE_boolean("dgn", False, "Use Data-Guided Noise for exploration rollouts.")
+flags.DEFINE_integer(
+    "dgn_update_interval", 2000, "Env steps between covariance refits (paper: 2000 Adroit)."
+)
+flags.DEFINE_integer("dgn_epochs", 10, "Epochs per refit (paper: 10 Adroit).")
+flags.DEFINE_integer("dgn_hidden_dim", 256, "Covariance MLP width (paper: 256 Adroit).")
+flags.DEFINE_integer("dgn_num_layers", 2, "Covariance MLP hidden layers (paper: 2).")
+flags.DEFINE_integer("dgn_batch_size", 128, "Covariance fit batch size (paper: 128).")
+flags.DEFINE_float("dgn_dropout", 0.5, "Covariance MLP dropout (paper: 0.5).")
+flags.DEFINE_float("dgn_weight_decay", 3e-2, "AdamW weight decay (paper: 3e-2).")
+flags.DEFINE_float("dgn_lr", 3e-4, "Covariance LR (NOT specified in the paper).") # Not specified
+flags.DEFINE_float(
+    "dgn_anneal_tau", 30000.0, "Noise scale exp(-t/tau); <=0 disables (paper Adroit: 30000)."
 )
 
 config_flags.DEFINE_config_file(
@@ -120,6 +137,28 @@ def main(_):
         FLAGS.seed, env.observation_space, env.action_space, **kwargs
     )
 
+    # DGN: the prior data (human demos + BC rollouts, exactly what RLPD's offline buffer
+    # holds) is also the dataset the covariance net is fit on.
+    dgn, demo_obs, demo_act = None, None, None
+    if FLAGS.dgn:
+        demo_obs = np.asarray(ds.dataset_dict["observations"], dtype=np.float32)
+        demo_act = np.asarray(ds.dataset_dict["actions"], dtype=np.float32)
+        dgn = DGN(
+            obs_dim=demo_obs.shape[-1],
+            action_dim=demo_act.shape[-1],
+            seed=FLAGS.seed,
+            hidden_dim=FLAGS.dgn_hidden_dim,
+            num_layers=FLAGS.dgn_num_layers,
+            dropout_rate=FLAGS.dgn_dropout,
+            lr=FLAGS.dgn_lr,
+            weight_decay=FLAGS.dgn_weight_decay,
+            batch_size=FLAGS.dgn_batch_size,
+            epochs=FLAGS.dgn_epochs,
+            grad_clip=1.0,     # Enable global norm gradient clipping
+            #min_diag=1e-2,     # Increase minimum diagonal for numerical stability
+        )
+        print(f"DGN: {len(demo_obs)} prior (s, a) pairs, action dim {demo_act.shape[-1]}")
+
     replay_buffer = ReplayBuffer(
         env.observation_space, env.action_space, FLAGS.max_steps
     )
@@ -150,8 +189,23 @@ def main(_):
     for i in tqdm.tqdm(
         range(0, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
+        # DGN: (re)fit the covariance net with the latest actor mean. The first fit happens
+        # at i == start_training, right before the first guided action.
+        if (
+            FLAGS.dgn
+            and i >= FLAGS.start_training
+            and (i - FLAGS.start_training) % FLAGS.dgn_update_interval == 0
+        ):
+            dgn_info = dgn.refit(agent, demo_obs, demo_act)
+            for k, v in dgn_info.items():
+                wandb.log({f"dgn/{k}": v}, step=i + FLAGS.pretrain_steps)
+
         if i < FLAGS.start_training:
             action = env.action_space.sample()
+        elif FLAGS.dgn:  # DGN: a = clip(mu_theta(s) + exp(-t/tau) * A_phi(s) z)
+            mu = actor_mean(agent, observation)
+            eps = noise_scale(i, FLAGS.dgn_anneal_tau) * dgn.noise(observation)
+            action = np.clip(mu + eps, env.action_space.low, env.action_space.high)
         else:
             action, agent = agent.sample_actions(observation)
         next_observation, reward, done, info = env.step(action)
@@ -197,6 +251,11 @@ def main(_):
             if i % FLAGS.log_interval == 0:
                 for k, v in update_info.items():
                     wandb.log({f"training/{k}": v}, step=i + FLAGS.pretrain_steps)
+                if FLAGS.dgn:  # DGN
+                    wandb.log(
+                        {"dgn/noise_scale": noise_scale(i, FLAGS.dgn_anneal_tau)},
+                        step=i + FLAGS.pretrain_steps,
+                    )
 
         if i % FLAGS.eval_interval == 0:
             eval_info = evaluate(

@@ -8,7 +8,7 @@ def get_config():
 
     config.model_cls = "SACLearner"
 
-    config.temp_lr = 3e-4
+    config.temp_lr = 1e-4
 
     config.init_temperature = 1.0
     config.target_entropy = config_dict.placeholder(float)
