@@ -131,3 +131,5 @@ dmypy.json
 # wandb
 wandb
 MUJOCO_LOG.TXT
+
+*:Zone.Identifier
